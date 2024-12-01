@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
-from memory_profiler import profile 
-
+import matplotlib.pyplot as plt
+from scipy.interpolate import RBFInterpolator
 # constants
 VELOCITY_AIR = 23 # m/s
 WING_GAUST_DURATION = 3 # seconds
@@ -13,16 +13,26 @@ TRANSISTION_MODE = "vtol_in_trans_mode"
 ARMED = "armed"
 VELOCITY_NORTH = "vel_n_m_s"
 VELOCITY_EAST = "vel_e_m_s"
+LONGITUDE = "lon"
+LATITUDE = "lat"
+
+
+# DATA_FILES_PATH = (
+#     "case_flight_logs/case_circular_flight_actuator_armed_0.csv",
+#     "case_flight_logs/case_circular_flight_distance_sensor_0.csv",
+#     "case_flight_logs/case_circular_flight_vehicle_gps_position_0.csv",
+#     "case_flight_logs/case_circular_flight_vtol_vehicle_status_0.csv",
+# )
 
 DATA_FILES_PATH = (
-    "case_flight_logs/case_circular_flight_actuator_armed_0.csv",
-    "case_flight_logs/case_circular_flight_distance_sensor_0.csv",
-    "case_flight_logs/case_circular_flight_vehicle_gps_position_0.csv",
-    "case_flight_logs/case_circular_flight_vtol_vehicle_status_0.csv",
+    "case_flight_logs/case_realistic_flight_actuator_armed_0.csv",
+    "case_flight_logs/case_realistic_flight_distance_sensor_0.csv",
+    "case_flight_logs/case_realistic_flight_vehicle_gps_position_0.csv",
+    "case_flight_logs/case_realistic_flight_vtol_vehicle_status_0.csv",
 )
 
 
-datasets = tuple(map(pd.read_csv, DATA_FILES_PATH))
+datasets = list(map(pd.read_csv, DATA_FILES_PATH))
 
 # Find a time interval where all sensors have been activated
 time_start, time_end, n = 0, np.inf, 0
@@ -34,7 +44,13 @@ for dataset in datasets:
 
 time = np.linspace(time_start, time_end, n)
 
-dataset_actuators, dataset_distance_sensor, dataset_gps, dataset_vehicle_status = datasets
+def make_dataset_uniform_in_time(time, dataset):
+    column_names = dataset.columns
+    column_data = np.array([np.interp(time, dataset[TIMESTAMP], column).astype(column.dtype) for column_name, column in dataset.items()]).T
+    dataframe = pd.DataFrame(data=column_data, columns=dataset.columns)
+    dataframe[TIMESTAMP] = time
+    return dataframe
+
 
 def slice_array(x, filter):
     """
@@ -50,7 +66,7 @@ def slice_array(x, filter):
     start_indicies = np.where(filter_difference == 1)[0]
     end_indicies = np.where(filter_difference == -1)[0]
 
-    if len(end_indicies) < start_indicies:
+    if len(end_indicies) < len(start_indicies):
         if start_indicies[-1] == len(x) -1:
             start_indicies = start_indicies[:-1]
         else:
@@ -64,46 +80,70 @@ def slice_array(x, filter):
     return slices
 
 
-def wind_gaust(time, wind):
-    delta_t = time[1] - time[0]
-    delta_t_seconds = delta_t/1000.
+def largest_wind_gaust(dataset):
+    delta_t = dataset[TIMESTAMP][1] - dataset[TIMESTAMP][0]
+    delta_t_seconds = delta_t/1_000_000.
     n = int(delta_t_seconds/WING_GAUST_DURATION)
 
+    magnitude = lambda vector: np.sqrt(vector[:,0]**2 + vector[:,1]**2)
+
+    velocity_ground = np.array([dataset[VELOCITY_EAST], dataset[VELOCITY_NORTH]])
+    velocity_air = velocity_ground/magnitude(velocity_ground) * VELOCITY_AIR
+
+    wind = velocity_ground - velocity_air
+    wind_magnitude = magnitude(wind)
+
+
+    fixed_wing_mode = ((dataset[ROTARY_WING_MODE] == 0) & (dataset[TRANSISTION_MODE] == 0) & (dataset[ARMED] == 1)).astype(dtype=np.int64)
+    time_slices = slice_array(dataset[TIMESTAMP], fixed_wing_mode)
+    wind_magnitude_slices = slice_array(dataset[TIMESTAMP], fixed_wing_mode)
+
     kernel = np.ones(n)/n
-    wind_gaust = np.convolve(wind, kernel, mode="valid")
 
-    largest_wind_gaust_index = np.argmax(wind_gaust)
+    largest_wind_gaust = 0
+    largest_wind_gaust_time = None
 
-    return wind_gaust[largest_wind_gaust_index], time[largest_wind_gaust_index]
-
-
-
-rotary_wing_mode = np.rint(np.interp(time, dataset_vehicle_status[TIMESTAMP], dataset_vehicle_status[ROTARY_WING_MODE]))
-transition_mode = np.rint(np.interp(time, dataset_vehicle_status[TIMESTAMP], dataset_vehicle_status[TRANSISTION_MODE]))
-armed = np.rint(np.interp(time, dataset_actuators[TIMESTAMP], dataset_actuators[ARMED]))
-fixed_wing_mode = np.array((rotary_wing_mode == 0) & (transition_mode == 0) & (armed == 1), dtype=np.int64)
-
-
-velocity_north = np.interp(time, dataset_gps[TIMESTAMP], dataset_gps[VELOCITY_NORTH])
-velocity_east = np.interp(time, dataset_gps[TIMESTAMP], dataset_gps[VELOCITY_EAST])
-velocity_ground = np.sqrt(velocity_east**2 + velocity_east**2)
-
-wind_magnitude = np.abs(velocity_ground-VELOCITY_AIR)
-wind_magnitude_slices = slice_array(wind_magnitude, fixed_wing_mode)
-time_slices = slice_array(time, fixed_wing_mode)
-
-
-largest_wind_gaust_time = None
-largest_wind_gaust_magnitude = 0
-
-for wind_gaust_time_slice, wind_magnitude_slice in time_slices, wind_magnitude_slices:
-    wind_gaust_magnitude, wind_gaust_time = wind_gaust(wind_gaust_time_slice, wind_gaust_magnitude)
-
-    if wind_gaust_magnitude > largest_wind_gaust_magnitude:
-        largest_wind_gaust_magnitude = wind_gaust_magnitude
-        largest_wind_gaust_time = wind_gaust_time
+    for time_slice, wind_magnitude_slice in zip(time_slices, wind_magnitude_slices):
+        if len(wind_magnitude_slice) > n:
+            wind_gaust = np.convolve(magnitude(wind), kernel, mode="valid")
+            largest_wind_gaust_index = np.argmax(wind_gaust)
+            if wind_gaust[largest_wind_gaust_index] > largest_wind_gaust:
+                largest_wind_gaust = wind_gaust[largest_wind_gaust_index]
+                largest_wind_gaust_time = time_slice[largest_wind_gaust_index]
+    
+    return largest_wind_gaust_time, largest_wind_gaust
 
 
 
-#https://simulationbased.com/2020/06/02/smoothing-data-by-rolling-average-with-numpy/
-#https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.interp2d.html
+
+dataset = pd.concat(list(map(lambda dataset:make_dataset_uniform_in_time(time, dataset), datasets)), axis=1)
+
+fixed_wing_mode = ((dataset[ROTARY_WING_MODE] == 0) & (dataset[TRANSISTION_MODE] == 0) & (dataset[ARMED] == 1)).astype(dtype=np.int64)
+dataset_sliced = pd.concat(slice_array(dataset, fixed_wing_mode))
+
+magnitude = lambda vector: np.sqrt(vector[:,0]**2 + vector[:,1]**2)
+
+velocity_ground = np.array([dataset_sliced[VELOCITY_EAST], dataset_sliced[VELOCITY_NORTH]]).T
+velocity_air = (velocity_ground.T*(1/magnitude(velocity_ground))).T * VELOCITY_AIR
+
+wind = velocity_ground - velocity_air
+
+
+
+X = np.linspace(np.min(dataset[LONGITUDE]), np.max(dataset[LONGITUDE]), 100)
+Y = np.linspace(np.min(dataset[LATITUDE]), np.max(dataset[LATITUDE]), 100)
+
+mesh_x, mesh_y = np.meshgrid(X, Y)
+
+
+
+mesh = np.dstack([mesh_x, mesh_y])
+
+interpolated_wind_smoothed = RBFInterpolator(np.array([dataset_sliced[LONGITUDE], dataset_sliced[LATITUDE]]).T, wind, smoothing=3.)
+wind_mesh_smoothed = np.array([interpolated_wind_smoothed(row) for row in mesh])
+
+interpolated_wind = RBFInterpolator(np.array([dataset_sliced[LONGITUDE], dataset_sliced[LATITUDE]]).T, wind)
+wind_mesh = np.array([interpolated_wind(row) for row in mesh])
+
+standard_deviation_wind = np.sqrt((wind_mesh - wind_mesh_smoothed)**2)
+
